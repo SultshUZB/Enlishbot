@@ -514,4 +514,161 @@ async def send_next_question(context: ContextTypes.DEFAULT_TYPE):
 
 # Javob qayta ishlash
 async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update
+    query = update.callback_query
+    await query.answer()
+    
+    user = query.from_user
+    chat_id = query.message.chat_id
+    data_parts = query.data.split('_')
+    question_index = int(data_parts[1])
+    user_answer = '_'.join(data_parts[2:])
+    
+    # Test ma'lumotlarini olish
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute('SELECT questions_data FROM active_tests WHERE chat_id = ?', (chat_id,))
+    result = cursor.fetchone()
+    
+    if not result:
+        return
+    
+    questions = eval(result[0])
+    
+    if question_index >= len(questions):
+        return
+    
+    question_data = questions[question_index]
+    correct_answer = question_data['correct']
+    
+    # Javobni tekshirish
+    is_correct = (user_answer == correct_answer)
+    
+    # Javobni saqlash
+    cursor.execute('''
+        INSERT OR REPLACE INTO user_answers (user_id, chat_id, question_index, answer, is_correct)
+        VALUES (?, ?, ?, ?, ?)
+    ''', (user.id, chat_id, question_index, user_answer, is_correct))
+    
+    conn.commit()
+    conn.close()
+    
+    # Foydalanuvchiga javob haqida xabar
+    if is_correct:
+        await query.edit_message_text("✅ To'g'ri!")
+    else:
+        await query.edit_message_text("❌ Noto'g'ri!")
+
+# Testni tugatish
+async def finish_test(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    # Test ma'lumotlarini olish
+    cursor.execute('SELECT unit_number FROM active_tests WHERE chat_id = ?', (chat_id,))
+    test_data = cursor.fetchone()
+    unit_number = test_data[0] if test_data else 1
+    
+    # Natijalarni hisoblash
+    cursor.execute('''
+        SELECT user_id, SUM(CASE WHEN is_correct = 1 THEN 1 ELSE 0 END) as score
+        FROM user_answers 
+        WHERE chat_id = ?
+        GROUP BY user_id 
+        ORDER BY score DESC
+    ''', (chat_id,))
+    
+    results = cursor.fetchall()
+    
+    # User ma'lumotlarini olish
+    user_scores = []
+    for user_id, score in results:
+        cursor.execute('SELECT username, first_name FROM users WHERE user_id = ? AND chat_id = ?', (user_id, chat_id))
+        user_data = cursor.fetchone()
+        username = user_data[0] if user_data else None
+        first_name = user_data[1] if user_data else "Foydalanuvchi"
+        
+        display_name = f"@{username}" if username else first_name
+        user_scores.append((display_name, score))
+    
+    # Natija xabarini tayyorlash
+    result_text = f"🏁 \"Unit {unit_number}\" testi yakunlandi!\n20 ta savol berildi.\n\n"
+    
+    medals = ["🥇", "🥈", "🥉"]
+    for i, (name, score) in enumerate(user_scores[:10]):
+        if i < 3:
+            result_text += f"{medals[i]} {name} – {score}\n"
+        else:
+            result_text += f"{i+1}) {name} – {score}\n"
+    
+    result_text += "\n🏆 G'oliblarni tabriklaymiz!"
+    
+    # Natijalarni yuborish
+    try:
+        await context.bot.send_message(chat_id=chat_id, text=result_text)
+    except Exception as e:
+        logger.error(f"Natija yuborishda xato: {e}")
+    
+    # Test ma'lumotlarini tozalash
+    cursor.execute('DELETE FROM active_tests WHERE chat_id = ?', (chat_id,))
+    cursor.execute('DELETE FROM user_answers WHERE chat_id = ?', (chat_id,))
+    conn.commit()
+    conn.close()
+
+# Savollar generatsiyasi
+def generate_questions(unit_number: int):
+    unit_vocab = VOCABULARY.get(unit_number, {})
+    english_words = list(unit_vocab.keys())
+    uzbek_translations = list(unit_vocab.values())
+    
+    questions = []
+    
+    for english_word in english_words[:20]:
+        correct_translation = unit_vocab[english_word]
+        
+        # Noto'g'ri variantlar
+        wrong_options = random.sample(
+            [t for t in uzbek_translations if t != correct_translation], 
+            3
+        )
+        
+        options = wrong_options + [correct_translation]
+        random.shuffle(options)
+        
+        questions.append({
+            'english': english_word,
+            'correct': correct_translation,
+            'options': options
+        })
+    
+    return questions
+
+# Xatolik handler
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.error(f"Xato yuz berdi: {context.error}")
+
+# Asosiy funksiya
+def main():
+    # Database initialization
+    init_db()
+    logger.info("Database initialized")
+    
+    # Application yaratish
+    application = Application.builder().token(BOT_TOKEN).build()
+    
+    # Handlers
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("unit", start_unit_test))
+    application.add_handler(CallbackQueryHandler(begin_test, pattern="^start_test_"))
+    application.add_handler(CallbackQueryHandler(handle_answer, pattern="^answer_"))
+    
+    # Error handler
+    application.add_error_handler(error_handler)
+    
+    logger.info("Bot ishga tushdi...")
+    
+    # Polling ni ishga tushirish
+    application.run_polling()
+
+if __name__ == '__main__':
+    main()
